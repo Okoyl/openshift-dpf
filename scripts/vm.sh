@@ -84,7 +84,7 @@ function create_vms() {
            VM_MAC=$(echo "$interface_config" | jq -r '.["mac-address"]')
            VM_NAME="${VM_PREFIX}${i}"
 
-           network_full_arg="bridge=${BRIDGE_NAME},model=e1000e,mac=${VM_MAC}"
+           network_full_arg="bridge=${BRIDGE_NAME},model=virtio,mac=${VM_MAC}"
 
            log "INFO" "Starting VM creation for $VM_NAME with MAC: $VM_MAC..."
            nohup virt-install --name "$VM_NAME" --memory "$RAM" \
@@ -123,7 +123,7 @@ function create_vms() {
         fi
 
         # Construct the full --network argument string
-        network_full_arg="bridge=${BRIDGE_NAME},model=e1000e${network_mac_arg}"
+        network_full_arg="bridge=${BRIDGE_NAME},model=virtio${network_mac_arg}"
 
         # Create VM with virt-install
         log "INFO" "Starting VM creation for $VM_NAME..."
