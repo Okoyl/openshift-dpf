@@ -348,9 +348,6 @@ function deploy_hypershift() {
     # Step 8: Configure hypershift (create kubeconfig and copy to dpf-operator-system)
     configure_hypershift
 
-    # Step 9: Create ignition template
-    create_ignition_template
-
     log [INFO] "================================================================================"
     log [INFO] "Hosted Cluster deployment via DPF HCP Provisioner Operator completed!"
     log [INFO] "================================================================================"
@@ -376,13 +373,6 @@ function add_cno_image_override() {
             fi
         fi
     done
-}
-
-function create_ignition_template() {
-    log [INFO] "Creating ignition template..."
-    retry 10 40 "$(dirname "${BASH_SOURCE[0]}")/gen_template.py" -f "${GENERATED_DIR}/hcp_template.yaml" -c "${HOSTED_CLUSTER_NAME}" -hc "${CLUSTERS_NAMESPACE}"
-    log [INFO] "Ignition template created"
-    oc apply -f "$GENERATED_DIR/hcp_template.yaml"
 }
 
 function configure_hypershift() {
@@ -762,9 +752,6 @@ function main() {
                 ;;
             create-dpfhcpprovisioner-cr)
                 create_dpfhcpprovisioner_cr
-                ;;
-            create-ignition-template)
-                create_ignition_template
                 ;;
             deploy-dpucluster-csr-approver)
                 deploy_dpucluster_csr_approver
