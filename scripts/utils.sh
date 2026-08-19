@@ -462,6 +462,23 @@ libvirt_host_cmd() {
     fi
 }
 
+# Map uname -m to the value aicli expects for cpu_architecture.
+arch_for_aicli() {
+    case "$1" in
+        aarch64) echo "arm64" ;;
+        *)       echo "$1" ;;
+    esac
+}
+
+# Return the complementary architecture (aarch64 <-> x86_64).
+get_alt_arch() {
+    case "$1" in
+        aarch64) echo "x86_64" ;;
+        x86_64)  echo "aarch64" ;;
+        *)       log "ERROR" "Unknown architecture: $1"; return 1 ;;
+    esac
+}
+
 # Wraps virsh with the correct connection URI (local or remote).
 # Callers don't need to know about LIBVIRT_URI.
 lvirsh() {
@@ -488,10 +505,15 @@ libvirt_host_script() {
     fi
 }
 
-# Note: LIBVIRT_URI is computed at source time. This relies on env.sh being
-# sourced first (which sets LIBVIRT_HOST). If any script sources utils.sh
-# before setting LIBVIRT_HOST, the URI will silently fall back to local.
+# Note: LIBVIRT_URI and ARCH are computed at source time. This relies on
+# env.sh being sourced first (which sets LIBVIRT_HOST). If any script
+# sources utils.sh before setting LIBVIRT_HOST, the URI will silently
+# fall back to local and ARCH to the local machine's architecture.
 LIBVIRT_URI=$(libvirt_uri)
+
+if [ -z "${ARCH:-}" ]; then
+    ARCH=$(libvirt_host_cmd uname -m)
+fi
 
 generate_mac_from_machine_id() {
     local vm_name="$1"

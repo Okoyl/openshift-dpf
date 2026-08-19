@@ -17,7 +17,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/cluster.sh"
 PHYSICAL_NIC=${PHYSICAL_NIC:-$(ip route | awk '/default/ {print $5; exit}')}
 
 # ISO path derived from env.sh variables
-ISO_PATH="${ISO_FOLDER}/${CLUSTER_NAME}.iso"
+ISO_PATH="${ISO_FOLDER}/${CLUSTER_NAME}_infra-env.iso"
 
 # -----------------------------------------------------------------------------
 # Shared helpers

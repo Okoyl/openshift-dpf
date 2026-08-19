@@ -80,7 +80,7 @@ function check_cluster_installed() {
     while IFS= read -r cluster_id; do
         if [ -n "$cluster_id" ]; then
             local status=$(aicli info cluster "$cluster_id" -f status -v 2>/dev/null || echo "unknown")
-            if [ "$status" = "installed" ]; then
+            if [ "$status" = "installed" ] || [ "$status" = "adding-hosts" ]; then
                 log "INFO" "Found installed cluster ${CLUSTER_NAME} (ID: $cluster_id)"
                 installed_found=true
                 break
@@ -279,7 +279,7 @@ function check_create_cluster() {
     fi
 
     if ! aicli info cluster ${CLUSTER_NAME} >/dev/null 2>&1; then
-        log "INFO" "Cluster ${CLUSTER_NAME} not found, creating..."
+        log "INFO" "Cluster ${CLUSTER_NAME} not found, creating... (arch=${ARCH}, cpu_architecture=$(arch_for_aicli "$ARCH"))"
         
         ensure_ssh_key_in_home || return 1
         
@@ -287,12 +287,13 @@ function check_create_cluster() {
             log "INFO" "Creating single-node cluster..."
             aicli create cluster \
                 -P openshift_version="${OPENSHIFT_VERSION}" \
+                -P cpu_architecture="$(arch_for_aicli "$ARCH")" \
                 -P base_dns_domain="${BASE_DOMAIN}" \
                 -P pull_secret="${OPENSHIFT_PULL_SECRET}" \
                 -P high_availability_mode=None \
-		-P public_key="${SSH_KEY}" \
+                -P public_key="${SSH_KEY}" \
                 -P user_managed_networking=True \
-		"${paramfile_args[@]}" \
+                "${paramfile_args[@]}" \
                 "${CLUSTER_NAME}"
         else
             log "INFO" "Creating multi-node cluster..."
@@ -301,6 +302,7 @@ function check_create_cluster() {
             echo "INGRESS_VIPS: ${INGRESS_VIPS}"
             aicli create cluster \
                 -P openshift_version="${OPENSHIFT_VERSION}" \
+                -P cpu_architecture="$(arch_for_aicli "$ARCH")" \
                 -P base_dns_domain="${BASE_DOMAIN}" \
                 -P api_vips="${API_VIPS}" \
                 -P pull_secret="${OPENSHIFT_PULL_SECRET}" \
@@ -318,6 +320,29 @@ function check_create_cluster() {
 
 function delete_cluster() {
     log "INFO" "Deleting cluster ${CLUSTER_NAME}..."
+
+    for infraenv_name in \
+        "${CLUSTER_NAME}_infra-env" \
+        "${CLUSTER_NAME}_infra-env_alt_$(get_alt_arch "$ARCH")"; do
+        if aicli info infraenv "${infraenv_name}" &>/dev/null; then
+            local infra_env_id
+            infra_env_id=$(aicli -o json list infraenvs 2>/dev/null \
+                | jq -r --arg name "${infraenv_name}" '.[] | select(.name == $name) | .id' \
+                | head -1)
+            if [ -n "${infra_env_id}" ]; then
+                local host_ids
+                host_ids=$(aicli -o json list hosts 2>/dev/null \
+                    | jq -r --arg ieid "${infra_env_id}" '.[] | select(.infra_env_id == $ieid) | .id')
+                for host_id in ${host_ids}; do
+                    log "INFO" "Deleting host ${host_id} from ${infraenv_name}..."
+                    aicli delete host "${host_id}" -y || true
+                done
+            fi
+            log "INFO" "Deleting InfraEnv ${infraenv_name}..."
+            aicli delete infraenv "${infraenv_name}" -y || true
+        fi
+    done
+
     if ! aicli delete cluster ${CLUSTER_NAME} -y; then
         log "WARNING" "Failed to delete cluster ${CLUSTER_NAME}, continuing anyway"
     else
@@ -343,6 +368,11 @@ function wait_for_cluster_status() {
         # If waiting for 'ready' but status is already 'installed', treat as success
         if [ "$status" == "ready" ] && [ "$current_status" == "installed" ]; then
             log "INFO" "Cluster ${CLUSTER_NAME} is already installed. Skipping wait for 'ready'."
+            return 0
+        fi
+        # 'adding-hosts' implies the cluster is installed and accepting new nodes
+        if [ "$status" == "installed" ] && [ "$current_status" == "adding-hosts" ]; then
+            log "INFO" "Cluster ${CLUSTER_NAME} is installed and in adding-hosts mode."
             return 0
         fi
         if [ "$current_status" == "$status" ]; then
@@ -657,6 +687,7 @@ function create_day2_cluster() {
     # Check if cluster is already in adding-hosts status (day2 mode)
     if [ "${cluster_status}" = "adding-hosts" ]; then
         log "INFO" "Cluster ${CLUSTER_NAME} was already moved to day2 mode"
+        create_infraenv "$(get_alt_arch "$ARCH")"
         return 0
     fi
 
@@ -674,11 +705,38 @@ function create_day2_cluster() {
     fi
 
     log "INFO" "Cluster ${CLUSTER_NAME} successfully moved to day2 mode"
+    create_infraenv "$(get_alt_arch "$ARCH")"
     return 0
 }
 
+# Create an InfraEnv for the given architecture.
+# Naming convention: ${CLUSTER_NAME}_infra-env_alt_${arch}
+function create_infraenv() {
+    local target_arch="$1"
+    local aicli_arch
+    aicli_arch=$(arch_for_aicli "$target_arch")
+    local infraenv_name="${CLUSTER_NAME}_infra-env_alt_${target_arch}"
+
+    if aicli info infraenv "${infraenv_name}" &>/dev/null; then
+        log "INFO" "InfraEnv ${infraenv_name} already exists, skipping creation"
+        return 0
+    fi
+
+    log "INFO" "Creating InfraEnv ${infraenv_name} (cpu_architecture=${aicli_arch})..."
+    if ! aicli create infraenv "${infraenv_name}" \
+            -P cluster="${CLUSTER_NAME}" \
+            -P cpu_architecture="${aicli_arch}" \
+            -P openshift_version="${OPENSHIFT_VERSION}" \
+            -P pull_secret="${OPENSHIFT_PULL_SECRET}"; then
+        log "ERROR" "Failed to create InfraEnv ${infraenv_name}"
+        return 1
+    fi
+
+    log "INFO" "InfraEnv ${infraenv_name} created successfully"
+}
+
 function get_iso() {
-    local cluster_name="${1:-${CLUSTER_NAME}}"
+    local infraenv_name="$1"
     local cluster_type="${2:-day2}"
     local action="${3:-download}"
     local download_path="${ISO_FOLDER}"
@@ -686,18 +744,14 @@ function get_iso() {
 
     # Check if this is for day1 (master nodes) and cluster is already installed
     if [ "${cluster_type}" = "day1" ] && [ "${action}" = "download" ]; then
-        # Use a subshell to avoid side effects from modifying CLUSTER_NAME
-        if (
-            CLUSTER_NAME="${cluster_name}"
-            check_cluster_installed
-        ); then
+        if check_cluster_installed; then
             log "INFO" "Skipping ISO download as cluster is already installed"
             return 0
         fi
     fi
 
-    log "INFO" "Getting ISO URL..."
-    local iso_url="$(aicli info iso "${cluster_name}" -s | sed 's/\x1b\[[0-9;]*m//g')"
+    log "INFO" "Getting ISO URL for ${infraenv_name}..."
+    local iso_url="$(aicli info iso "${infraenv_name}" -s | sed 's/\x1b\[[0-9;]*m//g')"
 
     if [ -z "${iso_url}" ]; then
         log "INFO" "No direct URL found. Use console.redhat.com to generate an ISO."
@@ -711,19 +765,18 @@ function get_iso() {
         return 0
     fi
 
-    # Note: remote and local use different tools (curl vs aicli), so this
-    # cannot be collapsed into a single libvirt_host_cmd call.
+    local iso_dest="${download_path}/${infraenv_name}.iso"
+    log "INFO" "Downloading ISO to ${iso_dest}..."
     if is_remote_libvirt; then
-        log "INFO" "Downloading ISO directly on remote host ${LIBVIRT_HOST}..."
         if ! libvirt_host_cmd mkdir -p "${download_path}" \
-            || ! libvirt_host_cmd curl -gfLo "${download_path}/${cluster_name}.iso" "${iso_url}"; then
+            || ! libvirt_host_cmd curl -gfLo "${iso_dest}" "${iso_url}"; then
             log "ERROR" "Failed to download ISO on remote host ${LIBVIRT_HOST}"
             return 1
         fi
     else
         mkdir -p "${download_path}" || true
-        if ! aicli download iso "${cluster_name}" -p "${download_path}"; then
-            log "ERROR" "Failed to download ISO for cluster ${cluster_name}"
+        if ! curl -gfLo "${iso_dest}" "${iso_url}"; then
+            log "ERROR" "Failed to download ISO for ${infraenv_name}"
             return 1
         fi
     fi
@@ -746,15 +799,16 @@ function get_day2_cluster_id() {
     echo "${cluster_id}"
 }
 
-function get_day2_infra_env_id() {
+function get_infra_env_id() {
+    local infraenv_name="${1:-${CLUSTER_NAME}_infra-env}"
     local infra_env_id
     infra_env_id=$(aicli -o json list infraenvs 2>/dev/null \
-        | jq -r --arg name "${CLUSTER_NAME}" \
-          '.[] | select(.name == ($name + "_infra-env") or .name == $name) | .id' \
+        | jq -r --arg name "${infraenv_name}" --arg cluster "${CLUSTER_NAME}" \
+          '.[] | select(.name == $name or .name == $cluster) | .id' \
         | head -1)
 
     if [ -z "${infra_env_id}" ]; then
-        log "ERROR" "No InfraEnv found for cluster ${CLUSTER_NAME}"
+        log "ERROR" "No InfraEnv found with name ${infraenv_name}"
         return 1
     fi
     echo "${infra_env_id}"
@@ -769,7 +823,7 @@ function install_day2_hosts() {
 
     local cluster_id infra_env_id
     cluster_id=$(get_day2_cluster_id) || return 1
-    infra_env_id=$(get_day2_infra_env_id) || return 1
+    infra_env_id=$(get_infra_env_id) || return 1
 
     # Wait for hosts to register via InfraEnv
     log "INFO" "Waiting for ${expected_count} day2 host(s) to register..."
@@ -857,10 +911,15 @@ function main() {
             clean_all
             ;;
         download-iso)
-            get_iso "${CLUSTER_NAME}" "day1" "download"
+            get_iso "${CLUSTER_NAME}_infra-env" "day1" "download"
             ;;
         get-day2-iso)
-            get_iso "${CLUSTER_NAME}" "day2" "url"
+            local _alt_arch
+            _alt_arch=$(get_alt_arch "$ARCH")
+            log "INFO" "${ARCH} ISO:"
+            get_iso "${CLUSTER_NAME}_infra-env" "day2" "url"
+            log "INFO" "${_alt_arch} ISO:"
+            get_iso "${CLUSTER_NAME}_infra-env_alt_${_alt_arch}" "day2" "url"
             ;;
         download-day2-iso)
             # Apply worker NMState (MTU) to InfraEnv before downloading the ISO
@@ -871,10 +930,10 @@ function main() {
                 echo "static_network_config:" >> "$WORKER_STATIC_NET_FILE"
                 _generate_nmstate_dhcp_entries "$WORKER_STATIC_NET_FILE" "$VM_WORKER_COUNT" "$VM_WORKER_PREFIX" "$VM_COUNT"
                 local infra_env_id
-                infra_env_id=$(get_day2_infra_env_id) || exit 1
+                infra_env_id=$(get_infra_env_id) || exit 1
                 aicli update infraenv "${infra_env_id}" --paramfile "${WORKER_STATIC_NET_FILE}"
             fi
-            get_iso "${CLUSTER_NAME}" "day2" "download"
+            get_iso "${CLUSTER_NAME}_infra-env" "day2" "download"
             ;;
         create-day2-cluster)
             create_day2_cluster

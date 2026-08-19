@@ -175,15 +175,18 @@ if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
         unset _ocp_minor
     fi
 
-    # Auto-resolve OVN-Kubernetes image from the aarch64 OCP release payload
-    # Skip if the user already set OVN_KUBERNETES_IMAGE_TAG in .env
+    # Auto-resolve OVN-Kubernetes image from the aarch64 OCP release payload.
+    # The DPU is always aarch64 regardless of the host architecture.
+    # Strip -multi suffix from the version since per-arch tags use e.g. 4.22.7-aarch64.
     if [ -z "${OVN_KUBERNETES_IMAGE_TAG:-}" ] && command -v oc &>/dev/null; then
+        _ocp_base_version="${OPENSHIFT_VERSION%-multi}"
         _ovnk_full=$(oc adm release info --image-for=ovn-kubernetes \
-            "quay.io/openshift-release-dev/ocp-release:${OPENSHIFT_VERSION}-aarch64" 2>/dev/null || true)
+            "quay.io/openshift-release-dev/ocp-release:${_ocp_base_version}-aarch64" 2>/dev/null || true)
         if [ -n "$_ovnk_full" ]; then
             OVN_KUBERNETES_IMAGE_REPO="${_ovnk_full%@*}@sha256"
             OVN_KUBERNETES_IMAGE_TAG="${_ovnk_full##*sha256:}"
         fi
+        unset _ocp_base_version
     fi
 
     # Storage class — conditional on STORAGE_TYPE and SKIP_DEPLOY_STORAGE
