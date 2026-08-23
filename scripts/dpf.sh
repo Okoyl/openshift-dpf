@@ -374,6 +374,9 @@ function deploy_hypershift() {
     log [INFO] "Checking hosted control plane pods..."
     oc -n ${HOSTED_CONTROL_PLANE_NAMESPACE} get pods || true
 
+    log [INFO] "Waiting for etcd StorageClass ${ETCD_STORAGE_CLASS} before expecting etcd pods to schedule..."
+    wait_for_storage_class "${ETCD_STORAGE_CLASS}" || return 1
+
     log [INFO] "Waiting for etcd pods..."
     wait_for_pods ${HOSTED_CONTROL_PLANE_NAMESPACE} "app=etcd" 60 10
 
