@@ -396,9 +396,7 @@ function start_cluster_installation() {
     if check_cluster_installed; then
         log "INFO" "Cluster ${CLUSTER_NAME} is already installed. Fetching kubeconfig..."
         get_kubeconfig
-        if [ "${SKIP_DEPLOY_STORAGE}" = "true" ]; then
-            validate_storage_classes_available || return 1
-        fi
+        ensure_cluster_storage || return 1
         return 0
     fi
 
@@ -413,18 +411,7 @@ function start_cluster_installation() {
     log "INFO" "Cluster installation completed successfully"
     get_kubeconfig
 
-    if [ "${SKIP_DEPLOY_STORAGE}" = "true" ]; then
-        log "INFO" "SKIP_DEPLOY_STORAGE=true: validating that required StorageClasses exist (user-provided storage)..."
-        validate_storage_classes_available
-        log "INFO" "Skipping LSO/ODF deployment; using existing StorageClasses."
-    elif [ "${STORAGE_TYPE}" == "odf" ]; then
-        log "INFO" "STORAGE_TYPE=odf detected. Deploying LSO and ODF..."
-        deploy_lso
-        deploy_odf
-    elif [[ "${OLM_WORKAROUND}" == "true" ]]; then
-        log "INFO" "OLM_WORKAROUND=true: deploying LVM via subscription (using catalog ${CATALOG_SOURCE_NAME})"
-        deploy_lvm
-    fi
+    ensure_cluster_storage || return 1
 }
 
 function get_kubeconfig() {
@@ -502,6 +489,57 @@ function clean_all() {
     log "Full cleanup complete"
 }
 
+# Deploy or validate storage used by hosted-cluster etcd. Must run even when the
+# management cluster is already installed so re-runs of `make all` still get a
+# working StorageClass (etcd stays Pending without one).
+function ensure_cluster_storage() {
+    if [ "${SKIP_DEPLOY_STORAGE}" = "true" ]; then
+        log "INFO" "SKIP_DEPLOY_STORAGE=true: validating that required StorageClasses exist (user-provided storage)..."
+        validate_storage_classes_available || return 1
+        log "INFO" "Skipping LSO/LVM/ODF deployment; using existing StorageClasses."
+        return 0
+    fi
+
+    if [ "${STORAGE_TYPE}" == "odf" ]; then
+        log "INFO" "STORAGE_TYPE=odf detected. Deploying LSO and ODF..."
+        deploy_lso
+        deploy_odf || return 1
+        wait_for_storage_class "${ETCD_STORAGE_CLASS}" || return 1
+        return 0
+    fi
+
+    if [[ "${OLM_WORKAROUND}" == "true" ]]; then
+        log "INFO" "OLM_WORKAROUND=true: deploying LVM via subscription (using catalog ${CATALOG_SOURCE_NAME})"
+    else
+        log "INFO" "STORAGE_TYPE=${STORAGE_TYPE}: ensuring LVMCluster and etcd StorageClass exist"
+    fi
+    deploy_lvm || return 1
+}
+
+function wait_for_storage_class() {
+    local sc_name=${1:-${ETCD_STORAGE_CLASS}}
+    local max_attempts=${2:-90}
+    local delay=${3:-10}
+
+    if [ -z "${sc_name}" ]; then
+        log "ERROR" "ETCD_STORAGE_CLASS is empty; cannot wait for the etcd StorageClass"
+        return 1
+    fi
+
+    log "INFO" "Waiting for StorageClass ${sc_name} (hosted-cluster etcd PVCs)..."
+    if retry "${max_attempts}" "${delay}" oc get storageclass "${sc_name}" >/dev/null 2>&1; then
+        log "INFO" "StorageClass ${sc_name} is available"
+        return 0
+    fi
+
+    log "ERROR" "Timed out waiting for StorageClass ${sc_name}. Hosted-cluster etcd pods stay Pending until this exists."
+    oc get storageclass || true
+    oc get lvmcluster -A || true
+    oc get pods -n openshift-storage || true
+    oc get events -n openshift-storage --sort-by='.lastTimestamp' 2>/dev/null | tail -30 || true
+    return 1
+}
+
 # Validates that StorageClasses required when SKIP_DEPLOY_STORAGE=true exist in the cluster.
 # Requires KUBECONFIG to be set (cluster must be installed).
 function validate_storage_classes_available() {
@@ -559,6 +597,9 @@ function deploy_lvm() {
         retry 30 10 oc apply -f "${MANIFESTS_DIR}/cluster-installation/lvm/lvmcluster.yaml"
     fi
 
+    # lvms-vg1 (or ETCD_STORAGE_CLASS) appears only after the volume group is
+    # created on unused disks. Without it, Hypershift etcd PVCs stay Pending.
+    wait_for_storage_class "${ETCD_STORAGE_CLASS:-lvms-vg1}" || return 1
     log "INFO" "LVM Storage operator deployment completed."
 }
 

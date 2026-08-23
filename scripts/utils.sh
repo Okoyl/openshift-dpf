@@ -151,6 +151,8 @@ function wait_for_pods() {
     log "ERROR" "$label pods failed to become ready after $max_attempts attempts"
     oc get pods -n "$namespace" -l "$label" || true
     oc describe pod -n "$namespace" -l "$label" || true
+    oc get pvc -n "$namespace" || true
+    oc get events -n "$namespace" --sort-by='.lastTimestamp' 2>/dev/null | tail -40 || true
     exit 1
 }
 
