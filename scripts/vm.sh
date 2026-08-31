@@ -79,7 +79,7 @@ _create_vm() {
             --cpu host-passthrough \
             --boot uefi \
             --noautoconsole \
-            --wait=-1 &
+            --wait=-1 > /dev/null 2>&1 &
 }
 
 _wait_for_vms_running() {
